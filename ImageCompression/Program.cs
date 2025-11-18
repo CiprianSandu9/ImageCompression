@@ -7,55 +7,55 @@ public class Program
         Console.WriteLine("Image Compression Algorithm Analyzer");
         Console.WriteLine("====================================");
 
-        string imagePath = "images\\1.png";
-
-        if (!File.Exists(imagePath))
-        {
-            Console.WriteLine($"Error: The file '{imagePath}' was not found.");
-            return;
-        }
-
-        // --- The list of algorithms to test ---
         var algorithmsToTest = new List<ICompressionAlgorithm>
         {
             new PngCompressionAlgorithm(),
-            new TiffLzwCompressionAlgorithm()
+            new WebpCompressionAlgorithm(),
+            new PngAnsCompressionAlgorithm()
         };
 
-        try
+        string imagesPath = Path.Combine(AppContext.BaseDirectory, "images");
+
+        string[] fileEntries = Directory.GetFiles(imagesPath);
+        foreach (string fileName in fileEntries)
         {
-            // Load image and get its raw pixel data. We use this same raw data for all algorithms
-            // to ensure a fair comparison.
-            (byte[] rawPixelData, int width, int height) = await ImageHelper.LoadImageAsRawBytesAsync(imagePath);
-            long originalSize = new FileInfo(imagePath).Length;
-
-            Console.WriteLine($"\nAnalyzing '{Path.GetFileName(imagePath)}' ({width}x{height})");
-            Console.WriteLine($"Original Size: {originalSize / 1024.0:F2} KB");
-            Console.WriteLine("---------------------------------------------------------------------------------");
-
-            var results = new List<CompressionResult>();
-
-            // Run each algorithm and measure its performance
-            foreach (var algorithm in algorithmsToTest)
+            try
             {
-                Console.WriteLine($"Running {algorithm.Name}...");
-                var result = await RunCompressionTestAsync(algorithm, rawPixelData, width, height);
-                results.Add(result);
+                // Load image and get its raw pixel data. We use this same raw data for all algorithms
+                // to ensure a fair comparison.
+                (byte[] rawPixelData, int width, int height) = await ImageHelper.LoadImageAsRawBytesAsync(fileName);
+                long originalSize = new FileInfo(fileName).Length;
 
-                // Save the compressed file to disk
-                string outputFileName = $"{Path.GetFileNameWithoutExtension(imagePath)}_{algorithm.Name.Replace(" ", "")}{algorithm.FileExtension}";
-                await File.WriteAllBytesAsync($"images\\{outputFileName}", result.CompressedData);
-                Console.WriteLine($" -> Saved compressed file as '{outputFileName}'");
+                Console.WriteLine($"\nAnalyzing '{Path.GetFileName(fileName)}' ({width}x{height})");
+                Console.WriteLine($"Original Size: {originalSize / 1024.0:F2} KB");
+                Console.WriteLine("---------------------------------------------------------------------------------");
+
+                var results = new List<CompressionResult>();
+
+                // Run each algorithm and measure its performance
+                foreach (var algorithm in algorithmsToTest)
+                {
+                    Console.WriteLine($"Running {algorithm.Name}...");
+                    var result = await RunCompressionTestAsync(algorithm, rawPixelData, width, height);
+                    results.Add(result);
+
+                    // TODO: Rewrite saving logic
+                    // Save the compressed file to disk
+                    // string outputFileName = $"{Path.GetFileNameWithoutExtension(imagePath)}_{algorithm.Name.Replace(" ", "")}{algorithm.FileExtension}";
+                    // await File.WriteAllBytesAsync($"images\\{outputFileName}", result.CompressedData);
+                    // Console.WriteLine($" -> Saved compressed file as '{outputFileName}'");
+                }
+
+                // Display the final comparison results
+                PrintResultsTable(results, originalSize);                
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"An error occurred: {ex.Message}");
+            }
+        }
 
-            // Display the final comparison results
-            PrintResultsTable(results, originalSize);
-            Console.ReadKey();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"An error occurred: {ex.Message}");
-        }
+        Console.ReadKey();
     }
 
     /// <summary>
@@ -73,7 +73,7 @@ public class Program
 
         // --- Decompression & Verification ---
         stopwatch.Restart();
-        byte[] decompressedData = await Task.Run(() => algorithm.Decompress(compressedData));
+        byte[] decompressedData = await Task.Run(() => algorithm.Decompress(compressedData, width, height));
         stopwatch.Stop();
         var decompressionTime = stopwatch.Elapsed;
 

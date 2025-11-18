@@ -9,16 +9,42 @@
 
   <ItemGroup>
     <None Remove="images\1.png" />
+    <None Remove="images\girl_in_red.png" />
+    <None Remove="images\globe_west.png" />
+    <None Remove="images\gradient.png" />
+    <None Remove="images\parrots.png" />
+    <None Remove="images\rainbow_clouds.png" />
+    <None Remove="images\tux_logo.png" />
+    <None Remove="images\wikimedia_logo.png" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="images\1.png">
+    <Content Include="images\girl_in_red.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="images\globe_west.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="images\gradient.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="images\parrots.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="images\rainbow_clouds.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="images\tux_logo.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="images\wikimedia_logo.png">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.11" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.6" />
   </ItemGroup>
 
 </Project>
