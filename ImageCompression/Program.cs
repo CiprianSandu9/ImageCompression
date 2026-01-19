@@ -47,7 +47,7 @@ public class Program
                 }
 
                 // Display the final comparison results
-                PrintResultsTable(results, originalSize);                
+                PrintResultsTable(results, originalSize);
             }
             catch (Exception ex)
             {
@@ -55,7 +55,7 @@ public class Program
             }
         }
 
-        Console.ReadKey();
+        //Console.ReadKey();
     }
 
     /// <summary>

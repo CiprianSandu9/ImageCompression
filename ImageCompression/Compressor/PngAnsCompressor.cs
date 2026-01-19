@@ -1,59 +1,57 @@
-﻿using ZstdSharp;
+﻿using System;
+using System.Buffers;
+using System.IO;
+using System.Threading.Tasks;
+using ZstdSharp;
 
 namespace ImageCompression.CustomCompressor
 {
-    /// <summary>
-    /// PNG-like compression and decompression pipeline using ANS.
-    /// </summary>
     public static class PngAnsCompressor
     {
-        /// <summary>
-        /// Compresses an image using PNG-style adaptive filtering and Zstandard (ANS) compression.
-        /// </summary>
+        private const int Bpp = 4; // Rgba32
+
         public static byte[] CompressImage(byte[] rawPixelData, int width, int height)
         {
+            int stride = width * Bpp;
+            int totalSize = stride * height;
+            int maxBufferSize = 16 + height + totalSize;
 
-            byte[] filteredData = ApplyAdaptiveFiltering(rawPixelData, width, height, 4);
+            byte[] filteredBuffer = ArrayPool<byte>.Shared.Rent(maxBufferSize);
+            byte[] colorTransformedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
 
-            int compressionLevel = 14;
-            using var compressor = new Compressor(compressionLevel);
-
-            // Compress the FILTERED data
-            byte[] compressedFilteredData = compressor.Wrap(filteredData).ToArray();
-
-            // Compress the RAW data (no filter)
-            // On photos, this will almost always be SMALLER
-            byte[] compressedRawData = compressor.Wrap(rawPixelData).ToArray();
-
-            byte[] bestCompressedData;
-            bool wasFiltered;
-
-            if (compressedFilteredData.Length < compressedRawData.Length)
+            try
             {
-                bestCompressedData = compressedFilteredData;
-                wasFiltered = true;
+                ApplyColorTransform(rawPixelData, colorTransformedBuffer, width, height);
+
+                int filteredLength = ApplyAdaptiveFiltering(colorTransformedBuffer, filteredBuffer, width, height, stride);
+                var filteredSpan = new ReadOnlySpan<byte>(filteredBuffer, 0, filteredLength);
+
+                using var compressor = new Compressor(15); // Higher level for better ratio
+                byte[] compressedFiltered = compressor.Wrap(filteredSpan).ToArray();
+                byte[] compressedTransformed = compressor.Wrap(new ReadOnlySpan<byte>(colorTransformedBuffer, 0, totalSize)).ToArray();
+
+                bool useFiltered = compressedFiltered.Length < compressedTransformed.Length;
+                byte[] bestData = useFiltered ? compressedFiltered : compressedTransformed;
+
+                using var ms = new MemoryStream();
+                // 'leaveOpen: true' allows us to safely access 'ms' after 'bw' is disposed
+                using (var bw = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
+                {
+                    bw.Write(width);
+                    bw.Write(height);
+                    bw.Write(useFiltered);
+                    bw.Write(bestData);
+                } // bw.Dispose() is called here, forcing a FLUSH to 'ms'
+
+                return ms.ToArray();
             }
-            else
+            finally
             {
-                bestCompressedData = compressedRawData;
-                wasFiltered = false;
+                ArrayPool<byte>.Shared.Return(filteredBuffer);
+                ArrayPool<byte>.Shared.Return(colorTransformedBuffer);
             }
-
-            // Prepare final output: [width (4 bytes)][height (4 bytes)][wasFiltered (1 byte)][compressed data]
-            using var ms = new MemoryStream();
-            using var bw = new BinaryWriter(ms);
-
-            bw.Write(width);
-            bw.Write(height);
-            bw.Write(wasFiltered); // Write 1 byte (true/false)
-            bw.Write(bestCompressedData);
-
-            return ms.ToArray();
         }
 
-        /// <summary>
-        /// Decompresses an image, un-filters it, and saves it.
-        /// </summary>
         public static byte[] DecompressImage(byte[] compressedDataFull)
         {
             using var ms = new MemoryStream(compressedDataFull);
@@ -61,163 +59,218 @@ namespace ImageCompression.CustomCompressor
 
             int width = br.ReadInt32();
             int height = br.ReadInt32();
-            bool wasFiltered = br.ReadBoolean(); // Read filtered flag
-            const int bpp = 4; // Rgba32
+            bool wasFiltered = br.ReadBoolean();
 
-            byte[] compressedData = br.ReadBytes((int)(ms.Length - ms.Position));
+            int stride = width * Bpp;
+            int totalPixelsLen = stride * height;
 
-            // Decompress with ANS (Zstd)
+            byte[] compressedPayload = br.ReadBytes((int)(ms.Length - ms.Position));
+
             using var decompressor = new Decompressor();
-            byte[] decompressedData = decompressor.Unwrap(compressedData).ToArray();
+            byte[] decompressedData = decompressor.Unwrap(compressedPayload).ToArray();
 
-            // Un-apply filters (or don't)
-            byte[] rawPixelData;
+            byte[] resultImage;
+
             if (wasFiltered)
             {
-                // If we filtered it, we must un-filter it
-                rawPixelData = UnapplyFiltering(decompressedData, width, height, bpp);
+                byte[] rawImage = new byte[totalPixelsLen];
+                byte[] prevRowArr = ArrayPool<byte>.Shared.Rent(stride);
+
+                try
+                {
+                    // Initialize "previous row" to zeros for the first pass
+                    Array.Clear(prevRowArr, 0, stride);
+                    Span<byte> prevRow = prevRowArr.AsSpan(0, stride);
+
+                    var filterReader = new ReadOnlySpan<byte>(decompressedData);
+                    int readPos = 0;
+
+                    for (int y = 0; y < height; y++)
+                    {
+                        byte filterType = filterReader[readPos++];
+                        var filteredRow = filterReader.Slice(readPos, stride);
+                        readPos += stride;
+
+                        int rowStart = y * stride;
+
+                        for (int i = 0; i < stride; i++)
+                        {
+                            // A = Left (Safe: looks at rawImage which we are currently filling)
+                            byte a = (i < Bpp) ? (byte)0 : rawImage[rowStart + i - Bpp];
+
+                            // B = Up (Safe: looks at prevRow which hasn't changed yet)
+                            byte b = prevRow[i];
+
+                            // C = Up-Left (Safe: looks at prevRow which hasn't changed yet)
+                            byte c = (i < Bpp) ? (byte)0 : prevRow[i - Bpp];
+
+                            byte predicted = filterType switch
+                            {
+                                0 => 0,
+                                1 => a,
+                                2 => b,
+                                3 => (byte)((a + b) / 2),
+                                4 => PaethPredictor(a, b, c),
+                                _ => 0
+                            };
+
+                            // Reconstructed = FilteredDelta + Predicted
+                            rawImage[rowStart + i] = (byte)(filteredRow[i] + predicted);
+                        }
+
+                        // CRITICAL: Update prevRow only AFTER the entire row is reconstructed
+                        // We copy the data we just wrote (rawImage) into the prevRow buffer
+                        var completedRow = new ReadOnlySpan<byte>(rawImage, rowStart, stride);
+                        completedRow.CopyTo(prevRow);
+                    }
+                    resultImage = rawImage;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(prevRowArr);
+                }
             }
             else
             {
-                // The data was raw, so it's already perfect
-                rawPixelData = decompressedData;
+                resultImage = decompressedData;
             }
 
-            return rawPixelData;
+            InverseColorTransform(resultImage, width, height);
+            return resultImage;
         }
 
-        #region Filtering Logic
-
-        private enum FilterType : byte { None = 0, Sub = 1, Up = 2, Average = 3, Paeth = 4 }
-
-        private static byte[] ApplyAdaptiveFiltering(byte[] raw, int width, int height, int bpp)
+        private static void ApplyColorTransform(byte[] input, byte[] output, int width, int height)
         {
-            int stride = width * bpp;
-            // Output size = (1 byte filter type + stride) * height
-            var filtered = new MemoryStream(height + stride * height);
-            var prevRow = new byte[stride];
-            var currentRow = new byte[stride];
-            var filterBuffer = new byte[stride];
-
-            for (int y = 0; y < height; y++)
+            // Subtract Green Transform
+            int totalPixels = width * height;
+            Parallel.For(0, totalPixels, i =>
             {
-                int rowStart = y * stride;
-                Buffer.BlockCopy(raw, rowStart, currentRow, 0, stride);
+                int offset = i * 4;
+                // R G B A
+                byte g = input[offset + 1];
+                output[offset] = (byte)(input[offset] - g);     // R - G
+                output[offset + 1] = g;                             // G
+                output[offset + 2] = (byte)(input[offset + 2] - g); // B - G
+                output[offset + 3] = input[offset + 3];             // A
+            });
+        }
 
-                long bestFilterSum = long.MaxValue;
-                FilterType bestFilter = FilterType.None;
-                byte[] bestFilterBuffer = null;
+        private static void InverseColorTransform(byte[] data, int width, int height)
+        {
+            // Inverse Subtract Green
+            int totalPixels = width * height;
+            Parallel.For(0, totalPixels, i =>
+            {
+                int offset = i * 4;
+                byte g = data[offset + 1];
+                data[offset] = (byte)(data[offset] + g);     // R + G
+                data[offset + 2] = (byte)(data[offset + 2] + g); // B + G
+            });
+        }
 
-                // Try all 5 filters and pick the best one (lowest sum of absolute differences)
-                foreach (FilterType filterType in Enum.GetValues(typeof(FilterType)))
+        private static int ApplyAdaptiveFiltering(byte[] raw, byte[] outputBuffer, int width, int height, int stride)
+        {
+            // Each row in output: [FilterByte (1)] + [FilteredPixels (stride)]
+            int bytesPerRow = 1 + stride;
+
+            Parallel.For(0, height, y =>
+            {
+                int inputOffset = y * stride;
+                var currRow = new ReadOnlySpan<byte>(raw, inputOffset, stride);
+
+                ReadOnlySpan<byte> prevRow;
+                byte[]? tempPrevRow = null;
+
+                if (y == 0)
                 {
-                    long currentSum = 0;
-                    Filter(filterType, currentRow, prevRow, filterBuffer, bpp);
+                    // For the first row, the "previous row" is virtual and strictly zero.
+                    tempPrevRow = new byte[stride];
+                    prevRow = tempPrevRow;
+                }
+                else
+                {
+                    prevRow = new ReadOnlySpan<byte>(raw, inputOffset - stride, stride);
+                }
 
-                    foreach (byte b in filterBuffer)
-                    {
-                        // Use signed byte for sum calculation
-                        currentSum += Math.Abs((int)(sbyte)b);
-                    }
+                long bestSum = long.MaxValue;
+                byte bestFilter = 0;
 
-                    if (currentSum < bestFilterSum)
+                // Try all 5 filters
+                for (byte f = 0; f < 5; f++)
+                {
+                    long sum = CalculateFilterSum(f, currRow, prevRow);
+                    if (sum < bestSum)
                     {
-                        bestFilterSum = currentSum;
-                        bestFilter = filterType;
-                        // Swap buffers
-                        (bestFilterBuffer, filterBuffer) = (filterBuffer, new byte[stride]);
+                        bestSum = sum;
+                        bestFilter = f;
                     }
                 }
 
-                // Write the chosen filter type (1 byte) + filtered data
-                filtered.WriteByte((byte)bestFilter);
-                filtered.Write(bestFilterBuffer, 0, stride);
+                int outputRowOffset = y * bytesPerRow;
+                outputBuffer[outputRowOffset] = bestFilter;
+                WriteFilterOutput(bestFilter, currRow, prevRow, outputBuffer, outputRowOffset + 1);
+            });
 
-                // Current row becomes previous row for next iteration
-                Buffer.BlockCopy(currentRow, 0, prevRow, 0, stride);
-            }
-            return filtered.ToArray();
+            return height * bytesPerRow;
         }
 
-        private static void Filter(FilterType type, byte[] current, byte[] prev, byte[] output, int bpp)
+        private static long CalculateFilterSum(byte type, ReadOnlySpan<byte> current, ReadOnlySpan<byte> prev)
+        {
+            long sum = 0;
+            for (int i = 0; i < current.Length; i++)
+            {
+                byte a = (i < Bpp) ? (byte)0 : current[i - Bpp];
+                byte b = prev[i];
+                byte c = (i < Bpp) ? (byte)0 : prev[i - Bpp];
+
+                byte predicted = type switch
+                {
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => (byte)((a + b) / 2),
+                    4 => PaethPredictor(a, b, c),
+                    _ => 0
+                };
+
+                // FIXED: Cast to sbyte, then int to handle negative wrapping correctly
+                int diff = (sbyte)(current[i] - predicted);
+                sum += diff < 0 ? -diff : diff;
+            }
+            return sum;
+        }
+
+        private static void WriteFilterOutput(byte type, ReadOnlySpan<byte> current, ReadOnlySpan<byte> prev, byte[] output, int outOffset)
         {
             for (int i = 0; i < current.Length; i++)
             {
-                byte a = (i < bpp) ? (byte)0 : current[i - bpp]; // Left
-                byte b = prev[i];                                // Above
-                byte c = (i < bpp) ? (byte)0 : prev[i - bpp];    // Above-left
+                byte a = (i < Bpp) ? (byte)0 : current[i - Bpp];
+                byte b = prev[i];
+                byte c = (i < Bpp) ? (byte)0 : prev[i - Bpp];
 
-                output[i] = (byte)(current[i] - type switch
+                byte predicted = type switch
                 {
-                    FilterType.None => 0,
-                    FilterType.Sub => a,
-                    FilterType.Up => b,
-                    FilterType.Average => (byte)((a + b) / 2),
-                    FilterType.Paeth => PaethPredictor(a, b, c),
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => (byte)((a + b) / 2),
+                    4 => PaethPredictor(a, b, c),
                     _ => 0
-                });
+                };
+
+                output[outOffset + i] = (byte)(current[i] - predicted);
             }
         }
 
         private static byte PaethPredictor(byte a, byte b, byte c)
         {
-            int p = a + b - c;     // Initial estimate
-            int pa = Math.Abs(p - a);  // Distances to a, b, c
+            int p = a + b - c;
+            int pa = Math.Abs(p - a);
             int pb = Math.Abs(p - b);
             int pc = Math.Abs(p - c);
-
-            // Return nearest of a, b, c
             if (pa <= pb && pa <= pc) return a;
             if (pb <= pc) return b;
             return c;
         }
-
-        #endregion
-
-        #region Un-filtering Logic
-
-        private static byte[] UnapplyFiltering(byte[] filtered, int width, int height, int bpp)
-        {
-            int stride = width * bpp;
-            byte[] raw = new byte[stride * height];
-            byte[] prevRow = new byte[stride]; // Starts as all zeros
-
-            var ms = new MemoryStream(filtered);
-
-            for (int y = 0; y < height; y++)
-            {
-                var filterType = (FilterType)ms.ReadByte(); // Read the 1-byte filter type
-
-                byte[] filteredRow = new byte[stride];
-                ms.Read(filteredRow, 0, stride);
-
-                int rowStart = y * stride;
-
-                for (int i = 0; i < stride; i++)
-                {
-                    byte a = (i < bpp) ? (byte)0 : raw[rowStart + i - bpp]; // Left
-                    byte b = prevRow[i];                                  // Above
-                    byte c = (i < bpp) ? (byte)0 : prevRow[i - bpp];        // Above-left
-
-                    byte recon = (byte)(filteredRow[i] + filterType switch
-                    {
-                        FilterType.None => 0,
-                        FilterType.Sub => a,
-                        FilterType.Up => b,
-                        FilterType.Average => (byte)((a + b) / 2),
-                        FilterType.Paeth => PaethPredictor(a, b, c),
-                        _ => 0
-                    });
-
-                    raw[rowStart + i] = recon;
-                }
-
-                // Current reconstructed row becomes previous row
-                Buffer.BlockCopy(raw, rowStart, prevRow, 0, stride);
-            }
-            return raw;
-        }
-
-        #endregion
     }
 }

@@ -17,7 +17,7 @@ public static class ImageHelper
     }
 
     /// <summary>
-    /// Extracts the raw RGBA32 pixel data from an ImageSharp Image object.
+    /// Extracts the raw Rgba32 pixel data from an ImageSharp Image object.
     /// </summary>
     public static byte[] GetPixelData(Image<Rgba32> image)
     {
