@@ -17,7 +17,7 @@ public interface ICompressionAlgorithm
     /// <summary>
     /// Compresses the raw image pixel data.
     /// </summary>
-    /// <param name="rawPixelData">A byte array of the raw pixel data (e.g., in RGB24 format).</param>
+    /// <param name="rawPixelData">A byte array of the raw pixel data (e.g., in RGBA32 format).</param>
     /// <param name="width">The width of the image.</param>
     /// <param name="height">The height of the image.</param>
     /// <returns>A byte array containing the compressed data.</returns>
